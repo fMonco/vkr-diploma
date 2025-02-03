@@ -1,0 +1,28 @@
+tags:
+  - docker
+  
+stages:
+  - lint
+  - test
+
+variables:
+  DOCKER_DRIVER: overlay2  # Для работы с Docker внутри DinD (Docker-in-Docker)
+
+lint:
+  stage: lint
+  image: python:3.11
+  script:
+    - pip install flake8 black
+    - black --check .  # Проверка форматирования кода
+    - flake8 .         # Статический анализ
+
+test:
+  stage: test
+  image: python:3.11
+  services:
+    - docker:20-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+  script:
+    - pip install pytest
+    - pytest

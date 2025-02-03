@@ -1,0 +1,67 @@
+stages:
+  - build
+  - test
+  - deploy
+
+# Сборка Docker образа
+docker_build:
+  image: docker:latest
+  stage: build
+  script:
+    - docker build -t sample:latest .  # Сборка Docker образа на основе Dockerfile
+
+# Тестирование безопасности с использованием Bandit
+bandit:
+  image: python:3.11
+  stage: test
+  script:
+    - pip install bandit
+    - bandit -r .  # Запуск анализа безопасности по всем файлам проекта
+  allow_failure: true
+
+# Статический анализ с использованием pylint
+pylint:
+  image: python:3.11
+  stage: test
+  script:
+    - pip install pylint
+    - pylint .  # Статический анализ кода
+  allow_failure: true
+
+# Статический анализ с использованием flake8
+flake8:
+  image: python:3.11
+  stage: test
+  script:
+    - pip install flake8
+    - flake8 .  # Статический анализ кода
+  allow_failure: true
+
+# Проверка безопасности зависимостей с использованием safety
+variables:
+  SAFETY_API_KEY: $SAFETY_API_KEY
+safety:
+  image: python:3.11
+  stage: test
+  script:
+    - pip install safety
+    - safety scan --key $SAFETY_API_KEY # Проверка безопасности зависимостей
+  allow_failure: true
+
+# Деплой на второй сервер через SSH и Docker
+deploy_second_server:
+  image: alpine:latest
+  stage: deploy
+  before_script:
+    - apk add --no-cache docker openssh-client
+    - echo "$SSH_PRIVATE_KEY" > /tmp/deploy_key
+    - chmod 400 /tmp/deploy_key
+  script:
+    - ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key gitlab@192.168.10.15 'sudo docker stop $(sudo docker ps -q)'
+    - ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key gitlab@192.168.10.15 'sudo docker system prune -af'
+    - docker save sample:latest | bzip2 | ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key gitlab@192.168.10.15 'sudo bunzip2 | sudo docker load'
+    - ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key gitlab@192.168.10.15 'sudo docker run -d -p 80:5000 sample:latest'
+    - ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key gitlab@192.168.10.15 'dig +short myip.opendns.com @resolver1.opendns.com'
+  only:
+    - main
+  when: manual

@@ -1,0 +1,59 @@
+stages:
+  - test
+  - deploy
+
+# Тестирование безопасности с использованием Bandit
+bandit:
+  image: python:3.9
+  stage: test
+  script:
+    - pip install bandit
+    - bandit -r app.py
+
+# Статический анализ кода с использованием pylint
+pylint:
+  image: python:3.9
+  stage: test
+  script:
+    - pip install pylint
+    - pylint app.py
+
+# Линтинг HTML с использованием htmlhint
+htmlhint:
+  image: node:18
+  stage: test
+  script:
+    - npm install -g htmlhint
+    - htmlhint *.html
+
+# Тестирование HTML с использованием html-validate
+html-validate:
+  image: node:18
+  stage: test
+  script:
+    - npm install -g html-validate
+    - html-validate *.html
+
+# Запуск тестов с pytest и покрытие кода с использованием coverage
+pytest:
+  image: python:3.9
+  stage: test
+  script:
+    - pip install -r requirements.txt  # Убедитесь, что файл requirements.txt существует
+    - pip install pytest coverage
+    - coverage run -m pytest
+    - coverage report
+    - coverage xml
+
+# Деплой приложения на сервер
+deploy:
+  image: python:3.9
+  stage: deploy
+  script:
+    - apt-get update && apt-get install -y sshpass
+    - sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no -r . $SSH_USER@$SERVER_IP:/home/$SSH_USER/app
+    - sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no $SSH_USER@$SERVER_IP "cd /home/$SSH_USER/app && docker build -t myapp:latest . && docker stop myapp || true && docker rm myapp || true && docker run -d --name myapp -p 80:80 myapp:latest"
+  only:
+    - master
+  variables:
+    DOCKER_DRIVER: overlay2

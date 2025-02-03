@@ -1,0 +1,250 @@
+# Pipeline configuration and variables
+######################################################################
+
+trigger:
+  - "master"
+
+name: "$(TeamProject)_$(Build.DefinitionName)_$(Date:yyyyMMdd)$(Rev:.r)"
+
+variables:
+  - name: "APP_NAME"
+    value: "docker-devops-test" # name of the app
+  - name: "APP_SETTINGS"
+    value: "WEBSITES_PORT=5000" # settings for the app
+  - name: "ACR_NAME"
+    value: "dockedevopstestacr" # name of the Azure Container Registry
+  - name: "IMAGE_NAME"
+    value: "devops-test" # name of the Docker Image to create
+  - name: "LOCATION"
+    value: "uksouth" # where does stuff need deploying?
+
+pool:
+  vmImage: "Ubuntu-20.04"
+
+stages:
+  # Setup Azure Resource Group
+  ######################################################################
+
+  - stage: "SetupRG"
+    displayName: "Resource Group"
+    jobs:
+      - job: "CreateResourceGroup"
+        displayName: "Resource Group - Setup"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az group create --name $(APP_NAME)-rg --location $(LOCATION)
+            displayName: "Resource Group - Use Azure CLI to setup or check"
+
+  # Setup Azure Container Registry if no service exist
+  ######################################################################
+
+  - stage: "SetupACR"
+    displayName: "Azure Container Registry"
+    dependsOn:
+      - "SetupRG"
+    jobs:
+      - job: "SetupCheckAzureContainerRegistry"
+        displayName: "Azure Container Registry - Setup"
+        variables:
+          - name: "DECODE_PERCENTS"
+            value: true
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                ACR_ID=$(az acr show --resource-group $APP_NAME-rg --name $ACR_NAME --query "id" -o tsv)
+                if [ -z "$ACR_ID" ]; then
+                  echo "There is no Azure Container Registry, we should sort that"
+                  az acr create --resource-group $(APP_NAME)-rg --name $(ACR_NAME) --sku Basic --admin-enabled true
+                else
+                  echo "There is already an Azure Container Registry, we don't need to do anything else here"
+                fi
+            displayName: "Azure Container Registry - Use Azure CLI check or setup"
+
+  # Build, Tag and Push Container
+  ######################################################################
+
+  - stage: "BuildContainer"
+    displayName: "Build, Tag and Push the container image"
+    dependsOn:
+      - "SetupACR"
+    jobs:
+      - deployment: BuildPushImage
+        displayName: "Build, tag and push the image"
+        environment: "production"
+        pool:
+          vmImage: "Ubuntu-20.04"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: "$(SUBSCRIPTION_NAME)"
+                    addSpnToEnvironment: true
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      export THETIMEANDDATE=$(date '+%Y-%m-%d-%H%M')
+                      echo "$THETIMEANDDATE will be the point in time tag"
+                      az acr login --name $(ACR_NAME) 
+                      docker image build -t $(IMAGE_NAME) ./
+                      docker image tag $(IMAGE_NAME) $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest
+                      docker image tag $(IMAGE_NAME) $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$THETIMEANDDATE
+                      docker image push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest 
+                      docker image push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$THETIMEANDDATE
+                  displayName: "Use Azure CLI to build and push the container image"
+
+  # Setup Azure App Serices and configure continuous deployment if no services exist
+  ######################################################################
+
+  - stage: "SetupAppServices"
+    displayName: "Azure App Services"
+    dependsOn:
+      - "SetupRG"
+      - "SetupACR"
+      - "BuildContainer"
+    jobs:
+      - job: "CheckForAppServicePlan"
+        displayName: "App Service Plan - Check if App Service Plan exists"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                APP_SERVICE_PLAN_ID=$(az appservice plan show --resource-group $APP_NAME-rg --name $APP_NAME-asp --query "id" -o tsv)
+                if [ -z "$APP_SERVICE_PLAN_ID" ]; then
+                  echo "There is no App Service Plan, we should sort that"
+                  echo "##vso[task.setvariable variable=appServiceExist;isOutput=true]No" # there is no app service plan so we should do stuff
+                else
+                  echo "There is an App Service Plan, we don't need to do anything else here"
+                  echo "##vso[task.setvariable variable=appServiceExist;isOutput=true]Yes" # nothing to do lets move on
+                fi
+            name: "DetermineResult"
+            displayName: "App Service Plan - Check to see if there App Service Plan exists"
+      - job: "CreateAppServicePlan"
+        displayName: "App Service Plan - Setup"
+        dependsOn:
+          - "CheckForAppServicePlan"
+        condition: "eq(dependencies.CheckForAppServicePlan.outputs['DetermineResult.appServiceExist'], 'No')"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az appservice plan create --resource-group $(APP_NAME)-rg --name $(APP_NAME)-asp --is-linux
+            displayName: "App Service Plan - Use Azure CLI to setup"
+      - job: "CreateAppService"
+        displayName: "Web App - Setup"
+        dependsOn:
+          - "CheckForAppServicePlan"
+          - "CreateAppServicePlan"
+        condition: "eq(dependencies.CheckForAppServicePlan.outputs['DetermineResult.appServiceExist'], 'No')"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az webapp create --resource-group $(APP_NAME)-rg --plan $(APP_NAME)-asp --name $(APP_NAME) --deployment-container-image-name $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest
+            displayName: "Web App - Use Azure CLI to setup"
+      - job: "CreateAppServiceSettings"
+        displayName: "Web App - Configure Settings"
+        dependsOn:
+          - "CheckForAppServicePlan"
+          - "CreateAppServicePlan"
+          - "CreateAppService"
+        condition: "eq(dependencies.CheckForAppServicePlan.outputs['DetermineResult.appServiceExist'], 'No')"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az webapp config appsettings set --resource-group $(APP_NAME)-rg --name $(APP_NAME) --settings $(APP_SETTINGS)
+            displayName: "Web App - Use Azure CLI to configure the settings"
+      - job: "CreateAppServiceID"
+        displayName: "Web App - Configure & Assign Managed Identity"
+        dependsOn:
+          - "CheckForAppServicePlan"
+          - "CreateAppServicePlan"
+          - "CreateAppService"
+          - "CreateAppServiceSettings"
+        condition: "eq(dependencies.CheckForAppServicePlan.outputs['DetermineResult.appServiceExist'], 'No')"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az webapp identity assign --resource-group $(APP_NAME)-rg --name $(APP_NAME)
+              displayName: "Web App - Use Azure CLI to assign an identity"
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az role assignment create --assignee $(az webapp identity show  --resource-group $(APP_NAME)-rg --name $(APP_NAME) --query principalId --output tsv) --scope /subscriptions/$(az account show --query id --output tsv)/resourceGroups/$(APP_NAME)-rg/providers/Microsoft.ContainerRegistry/registries/$(ACR_NAME) --role "AcrPull"
+            displayName: "Web App - Use Azure CLI to assign an identity"
+      - job: "EnableCD"
+        displayName: "Web App - Configure Azure Container Registry connedction and enable continuous deployment"
+        dependsOn:
+          - "CheckForAppServicePlan"
+          - "CreateAppServicePlan"
+          - "CreateAppService"
+          - "CreateAppServiceSettings"
+          - "CreateAppServiceID"
+        condition: "eq(dependencies.CheckForAppServicePlan.outputs['DetermineResult.appServiceExist'], 'No')"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az webapp config container set --resource-group $(APP_NAME)-rg --name $(APP_NAME) --docker-custom-image-name $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest --docker-registry-server-url https://$(ACR_NAME).azurecr.io
+            displayName: "Web App - Configure the App Serivce to use Azure Container Registry"
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az webapp deployment container config --resource-group $(APP_NAME)-rg --name $(APP_NAME) --enable-cd true
+            displayName: "Web App - Enable continuous deployment whenever the image is updated on the WebApp"
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(SUBSCRIPTION_NAME)"
+              addSpnToEnvironment: true
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az acr webhook create --name $(ACR_NAME)webhook --registry $(ACR_NAME) --scope $(IMAGE_NAME):latest --actions push --uri $(az webapp deployment container show-cd-url --resource-group $(APP_NAME)-rg --name $(APP_NAME) --query "CI_CD_URL" -o tsv)
+            displayName: "Azure Container Registry - Add the web hook created in the last task to the Azure Container Registry"
