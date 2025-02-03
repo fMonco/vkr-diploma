@@ -1,0 +1,167 @@
+---
+- name: Installation of the Docker and Gitlab
+  hosts: gitlab-server, stage
+  become: yes
+  vars:
+    gitlab_external_url: "http://{{ ansible_host }}"
+    gitlab_root_password: "{{ lookup('file', 'secret.txt') }}"
+  tasks:
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Install Docker Compose
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/v2.22.0/docker-compose-linux-x86_64"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    - name: Install GitLab Runner
+      shell: |
+        curl -LJO "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/deb/gitlab-runner-helper-images.deb"
+        curl -LJO "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/deb/gitlab-runner_amd64.deb"
+        dpkg -i gitlab-runner-helper-images.deb gitlab-runner_amd64.deb
+      when: "'gitlab-server' in group_names"
+
+    - name: Prompt for GitLab Token
+      pause:
+        prompt: "Enter GitLab Token"
+      register: result_token
+      when: "'register_runner' in ansible_run_tags"
+      tags:
+        - register_runner
+
+    - name: Check if result_token is defined
+      debug:
+        msg: "GitLab Token is: {{ result_token.user_input }}"
+      when: "'register_runner' in ansible_run_tags and result_token is defined"
+      tags:
+        - register_runner
+
+    - name: Create config.toml for GitLab Runner
+      copy:
+        dest: /etc/gitlab-runner/config.toml
+        content: |
+          concurrent = 1
+          check_interval = 0
+          shutdown_timeout = 0
+
+          [session_server]
+            session_timeout = 1800
+
+          [[runners]]
+            name = "local-runner"
+            url = "{{ gitlab_external_url }}"
+            token = "{{ result_token.user_input }}"
+            executor = "docker"
+            [runners.custom_build_dir]
+            [runners.cache]
+              MaxUploadedArchiveSize = 0
+              [runners.cache.s3]
+              [runners.cache.gcs]
+              [runners.cache.azure]
+            [runners.docker]
+              tls_verify = false
+              image = "ubuntu:latest"
+              privileged = false
+              disable_entrypoint_overwrite = false
+              oom_kill_disable = false
+              disable_cache = false
+              volumes = ["/cache", "/var/run/docker.sock:/var/run/docker.sock"]
+              shm_size = 0
+              network_mtu = 0
+      when: "'register_runner' in ansible_run_tags and result_token is defined"
+      tags:
+        - register_runner
+
+    - name: Restart GitLab Runner service
+      service:
+        name: gitlab-runner
+        state: restarted
+      when: "'register_runner' in ansible_run_tags and result_token is defined"
+      tags:
+        - register_runner
+
+    - name: Gitlab Server
+      file:
+        path: /srv/gitlab
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: "'gitlab-server' in group_names"
+
+    - name: Docker Compose file
+      copy:
+        dest: /srv/gitlab/docker-compose.yml
+        content: |
+          version: '3.8'
+          services:
+            gitlab:
+              container_name: gitlab-server
+              image: gitlab/gitlab-ce:latest
+              hostname: "{{ ansible_host }}"
+              restart: unless-stopped
+              environment:
+                GITLAB_OMNIBUS_CONFIG: |
+                  external_url '{{ gitlab_external_url }}'
+                  gitlab_rails['gitlab_shell_ssh_port'] = 2222
+                  gitlab_rails['initial_root_password'] = '{{ gitlab_root_password }}'
+              ports:
+                - "80:80"
+                - "2222:22"
+              volumes:
+                - ./data/docker/gitlab/etc/gitlab:/etc/gitlab
+                - ./data/docker/gitlab/var/opt/gitlab:/var/opt/gitlab
+                - ./data/docker/gitlab/var/log/gitlab:/var/log/gitlab
+      when: "'gitlab-server' in group_names"
+      tags: 
+        - ip
+
+    - name: Start GitLab server
+      command: docker-compose up -d
+      args:
+        chdir: /srv/gitlab
+      when: "'gitlab-server' in group_names"
+      tags: 
+        - ip
+
+    - name: Wait for GitLab server to start
+      wait_for:
+        port: 80
+        host: "{{ ansible_host }}"
+        timeout: 600
+      when: "'gitlab-server' in group_names"
+      tags: 
+        - ip
+
+    - name: Debug message
+      debug:
+        msg: >
+          GitLab установлен и доступен по адресу {{ gitlab_external_url }}.
+          root пароль указан в файле secret.txt
+      when: "'gitlab-server' in group_names"
